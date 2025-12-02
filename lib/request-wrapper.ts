@@ -44,6 +44,7 @@ import logger from './logger';
 import { streamToPromise } from './stream-to-promise';
 import { createCookieInterceptor } from './cookie-support';
 import { chainError } from './chain-error';
+import { HAREncoder } from './har-encoder';
 
 /**
  * Retry configuration options.
@@ -254,15 +255,12 @@ export class RequestWrapper {
 
     const multipartForm = new FormData();
 
-    // Form params
     if (formData) {
       for (const key of Object.keys(formData)) { // eslint-disable-line
         let values = Array.isArray(formData[key]) ? formData[key] : [formData[key]];
-        // Skip keys with undefined/null values or empty object value
         values = values.filter((v) => v != null && !isEmptyObject(v));
 
         for (let value of values) { // eslint-disable-line
-          // Ignore special case of empty file object
           if (
             !Object.prototype.hasOwnProperty.call(value, 'contentType') ||
             Object.prototype.hasOwnProperty.call(value, 'data')
@@ -281,13 +279,10 @@ export class RequestWrapper {
       }
     }
 
-    // Path params
     url = parsePath(url, path);
 
-    // Headers
     options.headers = { ...options.headers };
 
-    // Convert array-valued query params to strings
     if (qs && Object.keys(qs).length > 0) {
       Object.keys(qs).forEach((key) => {
         if (Array.isArray(qs[key])) {
@@ -296,7 +291,6 @@ export class RequestWrapper {
       });
     }
 
-    // Add service default endpoint if options.url start with /
     if (url && url.charAt(0) === '/') {
       url = stripTrailingSlash(serviceUrl) + url;
     }
@@ -312,16 +306,27 @@ export class RequestWrapper {
 
     if (formData) {
       data = multipartForm;
-      // form-data generates headers that MUST be included or the request will fail
       headers = extend(true, {}, headers, multipartForm.getHeaders());
     }
 
-    // accept gzip encoded responses if Accept-Encoding is not already set
     headers['Accept-Encoding'] = headers['Accept-Encoding'] || 'gzip';
 
-    // compress request body data if enabled
     if (this.compressRequestData) {
       data = await this.gzipRequestBody(data, headers);
+    }
+
+    const harEncoder = HAREncoder.getInstance();
+    const harEnabled = harEncoder.isEnabled();
+    let harStartTime: Date;
+    let harReqContentType: string;
+    let harReqBodyPromise: Promise<Buffer> = Promise.resolve(Buffer.alloc(0));
+
+    if (harEnabled) {
+      harStartTime = new Date();
+      harReqContentType = getHeaderValue(headers, 'content-type');
+      const requestCapture = harEncoder.captureRequestBody(data);
+      data = requestCapture.data;
+      harReqBodyPromise = requestCapture.collect();
     }
 
     const requestParams = {
@@ -336,31 +341,96 @@ export class RequestWrapper {
       ...axiosOptions,
     };
 
-    return this.axiosInstance(requestParams).then(
-      (res) => {
-        // sometimes error responses will still trigger the `then` block - escape that behavior here
-        if (!res) {
-          return undefined;
-        }
+    let response;
+    let requestError;
+    try {
+      response = await this.axiosInstance(requestParams);
+    } catch (err) {
+      requestError = err;
+      response = err?.response;
+    }
 
-        // these objects contain circular json structures and are not always relevant to the user
-        // if the user wants them, they can be accessed through the debug properties
-        delete res.config;
-        delete res.request;
+    const harEndTime = harEnabled ? new Date() : undefined;
+    let harRespBodyPromise: Promise<Buffer> = Promise.resolve(Buffer.alloc(0));
+    let harRespContentType = '';
+    let responseHttpVersion: string;
 
-        // the other sdks use the interface `result` for the body
-        // eslint-disable-next-line @typescript-eslint/dot-notation
-        res['result'] = ensureJSONResponseBodyIsObject(res);
-        delete res.data;
+    if (harEnabled && response) {
+      responseHttpVersion = getResponseHttpVersion(response);
+      const responseCapture = harEncoder.captureResponseBody(response);
+      response.data = responseCapture.data;
+      harRespBodyPromise = responseCapture.collect();
+      harRespContentType = getHeaderValue(response.headers, 'content-type');
+    }
 
-        // return another promise that resolves with 'res' to be handled in generated code
-        return res;
-      },
-      (err) => {
-        // return another promise that rejects with 'err' to be handled in generated code
-        throw this.formatError(err);
+    const recordHarPromise = harEnabled
+      ? (async () => {
+          const requestBody = await harReqBodyPromise;
+          const responseBody = await harRespBodyPromise;
+          await harEncoder.record({
+            method,
+            url: response?.config?.url || url,
+            httpVersion: response?.request?.res?.httpVersion
+              ? `HTTP/${response.request.res.httpVersion}`
+              : undefined,
+            headers,
+            queryParams: qs,
+            requestBody,
+            response: response
+              ? {
+                  status: response.status,
+                  statusText: response.statusText,
+                  httpVersion: responseHttpVersion,
+                  headers: response.headers,
+                  redirectURL:
+                    response.status >= 300 && response.status < 400
+                      ? response.headers?.location || response.headers?.Location || ''
+                      : '',
+                }
+              : undefined,
+            responseBody,
+            requestContentType: harReqContentType,
+            responseContentType: harRespContentType,
+            startTime: harStartTime,
+            endTime: harEndTime,
+            error: requestError,
+          });
+        })()
+      : Promise.resolve();
+
+    const shouldAwaitHar = !(harEnabled && response && isStream(response.data));
+
+    if (requestError) {
+      if (shouldAwaitHar) {
+        await recordHarPromise;
+      } else {
+        recordHarPromise.catch(() => {});
       }
-    );
+      throw this.formatError(requestError);
+    }
+
+    if (!response) {
+      if (shouldAwaitHar) {
+        await recordHarPromise;
+      } else {
+        recordHarPromise.catch(() => {});
+      }
+      return undefined;
+    }
+
+    delete response.config;
+    delete response.request;
+
+    // eslint-disable-next-line @typescript-eslint/dot-notation
+    response['result'] = ensureJSONResponseBodyIsObject(response);
+    delete response.data;
+
+    if (shouldAwaitHar) {
+      await recordHarPromise;
+    } else {
+      recordHarPromise.catch(() => {});
+    }
+    return response;
   }
 
   /**
@@ -705,4 +775,27 @@ function ensureJSONResponseBodyIsObject(response: any): any | string {
   }
 
   return dataAsObject;
+}
+
+function getHeaderValue(headers: any, name: string): string {
+  if (!headers || !name) {
+    return '';
+  }
+
+  const lowerName = name.toLowerCase();
+  const headerKey = Object.keys(headers).find((key) => key.toLowerCase() === lowerName);
+  if (!headerKey) {
+    return '';
+  }
+
+  const value = headers[headerKey];
+  return Array.isArray(value) ? value.join(', ') : String(value);
+}
+
+function getResponseHttpVersion(response: any): string {
+  const httpVersion = response?.request?.res?.httpVersion;
+  if (!httpVersion) {
+    return undefined;
+  }
+  return httpVersion.startsWith('HTTP/') ? httpVersion : `HTTP/${httpVersion}`;
 }
