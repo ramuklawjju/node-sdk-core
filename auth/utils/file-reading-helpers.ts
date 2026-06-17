@@ -30,6 +30,7 @@ const defaultCredsFilename: string = 'ibm-credentials.env';
  * be specified filepath via the environment variable: `IBM_CREDENTIALS_FILE`.
  */
 export function readCredentialsFile() {
+  // existsSync is undefined in browser environments where the `fs` module is not available
   if (!existsSync) {
     return {};
   }
@@ -88,6 +89,7 @@ export function constructFilepath(filepath: string): string {
 }
 
 export function readCrTokenFile(filepath: string): string {
+  // existsSync is undefined in browser environments where the `fs` module is not available
   if (!existsSync) {
     return '';
   }
