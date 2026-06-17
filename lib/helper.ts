@@ -71,7 +71,7 @@ export async function getContentType(inputData: NodeJS.ReadableStream | Buffer):
   let contentType = null;
   if (isFileStream(inputData)) {
     // if the inputData is a NodeJS.ReadableStream
-    const mimeType = lookup(inputData.path as any); // TODO: cleue quick hack, per type definition path could also be a Buffer
+    const mimeType = lookup(inputData.path as any); // TODO: clue quick hack, per type definition path could also be a Buffer
     contentType = { mime: mimeType || null };
   } else if (Buffer.isBuffer(inputData)) {
     // if the inputData is a Buffer
