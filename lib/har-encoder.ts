@@ -44,6 +44,7 @@ export interface HarNameValue {
 export interface HarPostData {
   mimeType: string;
   text?: string;
+  encoding?: string;
   params?: Array<{ name: string; value?: string }>;
 }
 
@@ -136,7 +137,7 @@ interface BodyCaptureResult {
 }
 
 export class HAREncoder {
-  private static instance: HAREncoder;
+  private static instance: HAREncoder | undefined;
 
   private initialized = false;
 
@@ -162,7 +163,7 @@ export class HAREncoder {
       this.enabled = process.env.HAR_ENABLED === '1';
       if (this.enabled) {
         const customPath = process.env.HAR_FILE_PATH;
-        this.filePath = customPath || path.join(os.tmpdir(), 'ibm-go-sdk-core.har');
+        this.filePath = customPath || path.join(os.tmpdir(), 'ibm-node-sdk-core.har');
         logger.info(`HAR recording enabled, writing to: ${this.filePath}`);
       }
       this.initialized = true;
@@ -320,6 +321,7 @@ export class HAREncoder {
       harReq.postData = {
         mimeType: input.requestContentType || '',
         text,
+        ...(encoding ? { encoding } : {}),
       };
     }
 
@@ -477,28 +479,34 @@ function convertHeaders(headers: any): HarNameValue[] {
 }
 
 function convertQueryString(urlValue: string, params?: Record<string, any>): HarNameValue[] {
-  const result: HarNameValue[] = [];
-
-  if (params) {
-    Object.keys(params).forEach((key) => {
-      const value = params[key];
-      if (value === undefined || value === null) {
-        return;
-      }
-      const values = Array.isArray(value) ? value : [value];
-      values.forEach((val) => result.push({ name: key, value: String(val) }));
-    });
-  }
-
+  // Prefer URL query string (fully resolved by axios) to avoid duplicates.
+  // Fall back to the params object only when the URL has no query string or cannot be parsed.
   try {
     const parsedUrl = new URL(urlValue);
-    parsedUrl.searchParams.forEach((value, name) => {
-      result.push({ name, value });
-    });
+    if (parsedUrl.searchParams.size > 0) {
+      const result: HarNameValue[] = [];
+      parsedUrl.searchParams.forEach((value, name) => {
+        result.push({ name, value });
+      });
+      return result;
+    }
   } catch (err) {
-    // ignore parse errors
+    // ignore parse errors, fall through to params
   }
 
+  if (!params) {
+    return [];
+  }
+
+  const result: HarNameValue[] = [];
+  Object.keys(params).forEach((key) => {
+    const value = params[key];
+    if (value === undefined || value === null) {
+      return;
+    }
+    const values = Array.isArray(value) ? value : [value];
+    values.forEach((val) => result.push({ name: key, value: String(val) }));
+  });
   return result;
 }
 
@@ -677,9 +685,9 @@ function redactGenericSecrets(value: string): string {
   ];
 
   const redactedTokens = redactedKeywords.join('|');
-  const reAuthHeader = new RegExp(`(?m)^(Authorization|X-Auth\\S*): .*`);
-  const rePropertySetting = new RegExp(`(?i)(${redactedTokens})=[^&]*(&|$)`);
-  const reJsonField = new RegExp(`(?i)"([^"]*(${redactedTokens})[^"_]*)":\\s*"[^\\,]*"`);
+  const reAuthHeader = new RegExp(`^(Authorization|X-Auth\\S*): .*`, 'm');
+  const rePropertySetting = new RegExp(`(${redactedTokens})=[^&]*(&|$)`, 'i');
+  const reJsonField = new RegExp(`"([^"]*(${redactedTokens})[^"_]*)":\\s*"[^,]*"`, 'i');
 
   let redactedString = value;
   redactedString = redactedString.replace(reAuthHeader, '$1: [redacted]');

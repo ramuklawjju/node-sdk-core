@@ -1299,3 +1299,114 @@ describe('gzipRequestBody', () => {
 function makeCopy(obj) {
   return JSON.parse(JSON.stringify(obj));
 }
+
+// ---------------------------------------------------------------------------
+// HAR recording integration (via sendRequest)
+// ---------------------------------------------------------------------------
+
+describe('HAR recording via sendRequest', () => {
+  const os = require('os');
+  const path = require('path');
+  const { mkdtempSync, rmSync, readFileSync, existsSync } = require('fs');
+  const { HAREncoder } = require('../../dist/lib/har-encoder');
+
+  let dir;
+  let harFile;
+  let env;
+
+  beforeEach(() => {
+    dir = mkdtempSync(path.join(os.tmpdir(), 'har-rw-test-'));
+    harFile = path.join(dir, 'test.har');
+    env = process.env;
+    process.env = { HAR_ENABLED: '1', HAR_FILE_PATH: harFile };
+    HAREncoder.reset();
+    mockAxiosInstance.mockReset();
+  });
+
+  afterEach(() => {
+    process.env = env;
+    HAREncoder.reset();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('writes a HAR entry after a successful request', async () => {
+    mockAxiosInstance.mockResolvedValue({
+      data: { id: '1' },
+      status: 200,
+      statusText: 'OK',
+      headers: { 'content-type': 'application/json' },
+      config: { url: 'https://api.example.com/v1/resources' },
+      request: {},
+    });
+
+    await requestWrapperInstance.sendRequest({
+      defaultOptions: {
+        method: 'GET',
+        url: 'https://api.example.com/v1/resources',
+        headers: {},
+        qs: { limit: 10 },
+      },
+    });
+
+    // HAR is written synchronously for non-streaming responses
+    const archive = JSON.parse(readFileSync(harFile, 'utf8'));
+    expect(archive.log.entries).toHaveLength(1);
+    const entry = archive.log.entries[0];
+    expect(entry.request.method).toBe('GET');
+    expect(entry.response.status).toBe(200);
+  });
+
+  it('writes a HAR entry when the request fails with an error response', async () => {
+    const axiosError = new Error('Request failed with status code 403');
+    axiosError.response = {
+      data: { error: 'forbidden' },
+      status: 403,
+      statusText: 'Forbidden',
+      headers: { 'content-type': 'application/json' },
+      config: { url: 'https://api.example.com/v1/secure' },
+    };
+    mockAxiosInstance.mockRejectedValue(axiosError);
+
+    await expect(
+      requestWrapperInstance.sendRequest({
+        defaultOptions: {
+          method: 'GET',
+          url: 'https://api.example.com/v1/secure',
+          headers: {},
+          qs: {},
+        },
+      })
+    ).rejects.toThrow();
+
+    const archive = JSON.parse(readFileSync(harFile, 'utf8'));
+    expect(archive.log.entries).toHaveLength(1);
+    const entry = archive.log.entries[0];
+    expect(entry.response.status).toBe(403);
+  });
+
+  it('does not write a HAR file when HAR_ENABLED is not set', async () => {
+    // Override: disable HAR
+    process.env = {};
+    HAREncoder.reset();
+
+    mockAxiosInstance.mockResolvedValue({
+      data: 'ok',
+      status: 200,
+      statusText: 'OK',
+      headers: {},
+      config: { url: 'https://api.example.com/v1/public' },
+      request: {},
+    });
+
+    await requestWrapperInstance.sendRequest({
+      defaultOptions: {
+        method: 'GET',
+        url: 'https://api.example.com/v1/public',
+        headers: {},
+        qs: {},
+      },
+    });
+
+    expect(existsSync(harFile)).toBe(false);
+  });
+});

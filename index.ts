@@ -26,3 +26,15 @@ export { default as qs } from './lib/querystring';
 export { default as contentType } from './lib/content-type';
 export * from './lib/stream-to-promise';
 export { getNewLogger, SDKLogger } from './lib/get-new-logger';
+export {
+  HAREncoder,
+  HarArchive,
+  HarEntry,
+  HarLog,
+  HarRequest,
+  HarResponse,
+  HarContent,
+  HarPostData,
+  HarNameValue,
+  HarTimings,
+} from './lib/har-encoder';
